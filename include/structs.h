@@ -10,11 +10,14 @@ struct RotorChannel
     float currentPeak = -9999;
     bool rising = true;
 
-    int dipCounter = 0;                                      // counts completed peaks
-    float facePeak[FACES_PER_ROTOR] = {-9999, -9999, -9999}; // worst of the observed peaks per face
+    int dipCounter = 0; // counts completed peaks
+    float facePeak[FACES_PER_ROTOR] = {-9999, -9999, -9999};
     bool faceHasData[FACES_PER_ROTOR] = {false, false, false};
 
     unsigned long lastDipTime = 0;
+    unsigned long lastPulseInterval = 0;
+    unsigned long windowStartMs = 0;
+    bool lastConfirmWasForced = false;
     unsigned long intervalSumMs = 0;
     int intervalCount = 0;
 
@@ -28,6 +31,9 @@ struct RotorChannel
         rising = true;
         dipCounter = 0;
         lastDipTime = 0;
+        lastPulseInterval = 0;
+        windowStartMs = 0;
+        lastConfirmWasForced = false;
         intervalSumMs = 0;
         intervalCount = 0;
         for (int i = 0; i < FACES_PER_ROTOR; i++)

@@ -16,6 +16,7 @@ RotorChannel rear{PIN_SENSOR_REAR};
 
 float measuredRPM = 0;
 float ambientPa = SEA_LEVEL_PA;
+bool crankDetected = false;
 
 #ifdef SIMULATION_MODE
 // ---- Synthetic sensor for Wokwi testing ----
@@ -64,17 +65,13 @@ float simulateBar(int pin)
         depthFactor = 1.0f - fabsf(local - 0.5f) * 2.0f;
     }
 
-    // Baseline is near-atmospheric (the port sees roughly ambient pressure
-    // between compression events); each face's pressure RISES to a peak
-    // during its own compression stroke — that peak is the reading that
-    // matters, matching the original TR-01 firmware's logic.
     const float baselineBar = 0.5f;
-    float peakHeightBar = 8.0f; // good face: baseline + this = ~8.5 bar peak
+    float peakHeightBar = 8.0f;
 
     // Make front rotor's face 2 read noticeably worse, to prove the display
     // can show an uneven result (simulates a marginal seal).
     if (pin == PIN_SENSOR_FRONT && faceIndex == 1)
-        peakHeightBar = 4.0f; // bad face: baseline + this = ~4.5 bar peak
+        peakHeightBar = 4.0f;
 
     float value = baselineBar + peakHeightBar * depthFactor;
     value += ((float)random(-3, 3)) / 100.0f; // +/- 0.03 bar jitter
@@ -95,60 +92,86 @@ float readBar(int pin)
 #endif
 }
 
+void confirmFaceValue(RotorChannel &ch, float value, unsigned long now, bool wasNatural)
+{
+    bool trustInterval = wasNatural && !ch.lastConfirmWasForced;
+
+    if (trustInterval && ch.lastDipTime != 0)
+        ch.lastPulseInterval = now - ch.lastDipTime;
+
+    if (ch.dipCounter >= WARMUP_DIPS)
+    {
+        if (trustInterval && ch.lastDipTime != 0)
+        {
+            unsigned long interval = now - ch.lastDipTime;
+            ch.intervalSumMs += interval;
+            ch.intervalCount++;
+            Serial.print(ch.pin == PIN_SENSOR_FRONT ? "FRONT" : "REAR");
+            Serial.print(" pulse#");
+            Serial.print(ch.dipCounter);
+            Serial.print(" interval=");
+            Serial.print(interval);
+            Serial.println("ms");
+        }
+        int slot = (ch.dipCounter - WARMUP_DIPS) % FACES_PER_ROTOR;
+
+        if (!ch.faceHasData[slot] || value < ch.facePeak[slot])
+            ch.facePeak[slot] = value;
+        ch.faceHasData[slot] = true;
+    }
+
+    ch.lastDipTime = now;
+    ch.dipCounter++;
+    ch.lastConfirmWasForced = !wasNatural;
+}
+
 void updateChannel(RotorChannel &ch)
 {
     float reading = readBar(ch.pin);
+    unsigned long now = millis();
+
+    if (ch.windowStartMs == 0)
+        ch.windowStartMs = now;
+
+    unsigned long expectedMs = ch.lastPulseInterval > 0 ? ch.lastPulseInterval : DEFAULT_EXPECTED_INTERVAL_MS;
+    unsigned long timeoutMs = (unsigned long)(expectedMs * FACE_TIMEOUT_MULTIPLIER);
+    bool windowExpired = (now - ch.windowStartMs) > timeoutMs;
 
     if (ch.rising)
     {
         if (reading > ch.currentPeak)
             ch.currentPeak = reading;
-
-        // Peak confirmed once the reading has dropped enough below it —
-        // same "5 psi"-style hysteresis idea as the original TR-01 code.
-        if (ch.currentPeak - reading > MIN_DIP_DEPTH_BAR)
-        {
-            unsigned long now = millis();
-
-            if (ch.dipCounter >= WARMUP_DIPS)
-            {
-                if (ch.lastDipTime != 0)
-                {
-                    unsigned long interval = now - ch.lastDipTime;
-                    ch.intervalSumMs += interval;
-                    ch.intervalCount++;
-                    Serial.print(ch.pin == PIN_SENSOR_FRONT ? "FRONT" : "REAR");
-                    Serial.print(" pulse#");
-                    Serial.print(ch.dipCounter);
-                    Serial.print(" interval=");
-                    Serial.print(interval);
-                    Serial.println("ms");
-                }
-                int slot = (ch.dipCounter - WARMUP_DIPS) % FACES_PER_ROTOR;
-                if (!ch.faceHasData[slot] || ch.currentPeak < ch.facePeak[slot])
-                    ch.facePeak[slot] = ch.currentPeak;
-                ch.faceHasData[slot] = true;
-            }
-
-            ch.lastDipTime = now;
-            ch.dipCounter++;
-
-            ch.rising = false;
-            ch.troughRef = reading;
-        }
     }
     else
     {
         if (reading < ch.troughRef)
             ch.troughRef = reading;
+    }
 
-        // Trough confirmed once the reading has climbed enough above it —
-        // ready to start tracking the next face's peak.
-        if (reading - ch.troughRef > MIN_DIP_DEPTH_BAR)
-        {
-            ch.rising = true;
-            ch.currentPeak = reading;
-        }
+    bool amplitudeConfirmed = ch.rising
+                                  ? (ch.currentPeak - reading) > MIN_DIP_DEPTH_BAR
+                                  : (reading - ch.troughRef) > MIN_DIP_DEPTH_BAR;
+
+    if (ch.rising && amplitudeConfirmed)
+    {
+        confirmFaceValue(ch, ch.currentPeak, now, true);
+        ch.rising = false;
+        ch.troughRef = reading;
+        ch.windowStartMs = now;
+    }
+    else if (!ch.rising && amplitudeConfirmed)
+    {
+
+        ch.rising = true;
+        ch.currentPeak = reading;
+    }
+    else if (windowExpired)
+    {
+        float forcedValue = ch.rising ? ch.currentPeak : reading;
+        confirmFaceValue(ch, forcedValue, now, false);
+        ch.rising = true;
+        ch.currentPeak = reading;
+        ch.windowStartMs = now;
     }
 
     ch.lastReading = reading;
@@ -201,7 +224,7 @@ void drawResults(bool testRunning, bool lowSamples)
     display.setCursor(0, 0);
     if (!testRunning && lowSamples)
     {
-        display.print("LOW SAMPLES-RETEST");
+        display.print(crankDetected ? "LOW SAMPLES-RETEST" : "NO CRANK - RETRY");
     }
     else if (measuredRPM > 0)
     {
@@ -212,9 +235,18 @@ void drawResults(bool testRunning, bool lowSamples)
     }
     else
     {
-        display.print(testRunning ? "WARMING UP..." : "COMPRESSION TEST");
+        if (!testRunning)
+            display.print("COMPRESSION TEST");
+        else
+            display.print(crankDetected ? "TESTING..." : "WAITING FOR CRANK");
     }
     display.drawLine(0, 9, 128, 9, SSD1306_WHITE);
+
+    if (testRunning)
+    {
+        display.display();
+        return;
+    }
 
     display.setCursor(20 + 5, 12);
     display.print("F1");
@@ -293,9 +325,7 @@ void loop()
     static bool testRunning = false;
     static bool lastButtonState = HIGH;
     static unsigned long lastSample = 0;
-    static unsigned long lastDisplayUpdate = 0;
-    static unsigned long testStartMs = 0;
-    const unsigned long DISPLAY_INTERVAL_MS = 150;
+    static unsigned long phaseStartMs = 0;
 
     bool buttonNow = (digitalRead(PIN_BUTTON) == LOW);
 
@@ -304,12 +334,14 @@ void loop()
         front.reset();
         rear.reset();
         measuredRPM = 0;
+        crankDetected = false;
         ambientPa = bmpReady ? (float)bmp.readPressure() : SEA_LEVEL_PA;
-        testStartMs = millis();
+        phaseStartMs = millis();
 #ifdef SIMULATION_MODE
         resetSimulation();
 #endif
         testRunning = true;
+        drawResults(true, false);
     }
     lastButtonState = buttonNow;
 
@@ -321,18 +353,35 @@ void loop()
             lastSample = now;
             updateChannel(front);
             updateChannel(rear);
-            measuredRPM = calculateRPM();
+
+            if (!crankDetected)
+            {
+                bool frontConfirmed = front.dipCounter >= 2 &&
+                                      front.lastPulseInterval >= MIN_PLAUSIBLE_INTERVAL_MS &&
+                                      front.lastPulseInterval <= MAX_PLAUSIBLE_INTERVAL_MS;
+                bool rearConfirmed = rear.dipCounter >= 2 &&
+                                     rear.lastPulseInterval >= MIN_PLAUSIBLE_INTERVAL_MS &&
+                                     rear.lastPulseInterval <= MAX_PLAUSIBLE_INTERVAL_MS;
+
+                if (frontConfirmed || rearConfirmed)
+                {
+                    // Two consecutive pulses at a plausible cranking speed
+                    crankDetected = true;
+                    phaseStartMs = now;
+                    drawResults(true, false);
+                }
+            }
+
+            if (crankDetected)
+                measuredRPM = calculateRPM();
         }
 
-        if (now - lastDisplayUpdate >= DISPLAY_INTERVAL_MS)
-        {
-            lastDisplayUpdate = now;
-            drawResults(true, false);
-        }
-
-        bool enoughData = front.steadyPulses() >= MIN_STEADY_PULSES &&
+        bool enoughData = crankDetected &&
+                          front.steadyPulses() >= MIN_STEADY_PULSES &&
                           rear.steadyPulses() >= MIN_STEADY_PULSES;
-        bool timedOut = (now - testStartMs) >= MAX_TEST_MS;
+
+        unsigned long limit = crankDetected ? MAX_TEST_MS : WAIT_FOR_CRANK_TIMEOUT_MS;
+        bool timedOut = (now - phaseStartMs) >= limit;
 
         if (enoughData || timedOut)
         {
